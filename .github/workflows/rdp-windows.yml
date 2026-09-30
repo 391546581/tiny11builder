@@ -51,7 +51,6 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
 
-          Write-Host "::add-mask::$customPassword"
           "RDP_PASS=$customPassword" >> $env:GITHUB_ENV
 
       - name: Start Bore TCP Tunnel (Zero Config & No Account)
