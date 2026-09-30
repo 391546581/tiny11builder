@@ -1,0 +1,121 @@
+name: Test Windows App with Screenshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      installer_url:
+        description: 'Direct download URL for installer (EXE / MSI / ZIP / Portable app)'
+        required: false
+        default: 'https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.6.9/npp.8.6.9.portable.x64.zip'
+        type: string
+      app_path:
+        description: 'Relative path or absolute path of executable to launch for UI test'
+        required: false
+        default: 'app\notepad++.exe'
+        type: string
+      app_args:
+        description: 'Arguments when launching the app'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test-ui:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prepare test app
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path .\app -Force | Out-Null
+          New-Item -ItemType Directory -Path .\screenshots -Force | Out-Null
+
+          $url = "${{ inputs.installer_url }}".Trim()
+          if ($url) {
+            Write-Host "Downloading test package from $url ..."
+            $ext = [System.IO.Path]::GetExtension($url)
+            if (-not $ext -or $ext -notmatch '^\.(zip|exe|msi)$') {
+              $ext = '.zip'
+            }
+            $downloadFile = ".\download$ext"
+            Invoke-WebRequest -Uri $url -OutFile $downloadFile
+
+            if ($downloadFile.EndsWith('.zip', [System.StringComparison]::OrdinalIgnoreCase)) {
+              Write-Host "Extracting ZIP archive to .\app ..."
+              Expand-Archive -Path $downloadFile -DestinationPath .\app -Force
+            } elseif ($downloadFile.EndsWith('.msi', [System.StringComparison]::OrdinalIgnoreCase)) {
+              Write-Host "Running MSI silent install to target folder..."
+              Start-Process "msiexec.exe" -ArgumentList "/i `"$downloadFile`" /quiet /qn TARGETDIR=`"$((Get-Item .\app).FullName)`"" -Wait
+            } else {
+              Copy-Item $downloadFile -Destination ".\app\app.exe"
+            }
+          }
+
+      - name: Launch app and capture desktop screenshot
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+
+          function Take-ScreenShot([string]$outputPath) {
+            $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+            $bounds = $screen.Bounds
+            $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $bitmap.Save($outputPath, [System.Drawing.Imaging.ImageFormat]::Png)
+            $graphics.Dispose()
+            $bitmap.Dispose()
+            Write-Host "Screenshot saved to $outputPath (Resolution: $($bounds.Width)x$($bounds.Height))"
+          }
+
+          Take-ScreenShot ".\screenshots\01_before_launch.png"
+
+          $targetExe = "${{ inputs.app_path }}".Trim()
+          $resolvedExe = $null
+          if (Test-Path $targetExe) {
+            $resolvedExe = (Get-Item $targetExe).FullName
+          } else {
+            $candidate = Get-ChildItem -Path .\app -Filter "*.exe" -File -Recurse | Select-Object -First 1
+            if ($candidate) {
+              $resolvedExe = $candidate.FullName
+            }
+          }
+
+          if (-not $resolvedExe) {
+            throw "No executable found to launch. Checked '$targetExe' and searched in .\app"
+          }
+
+          Write-Host "Launching executable: $resolvedExe"
+          $process = Start-Process -FilePath $resolvedExe -ArgumentList "${{ inputs.app_args }}" -PassThru
+
+          Start-Sleep -Seconds 5
+          Take-ScreenShot ".\screenshots\02_app_running.png"
+
+          $allWindows = Get-Process | Where-Object { $_.MainWindowTitle } | Select-Object ProcessName, Id, MainWindowTitle
+          Write-Host "=== Active Windows with GUI Titles ==="
+          $allWindows | Format-Table -AutoSize
+
+          if ($process -and -not $process.HasExited) {
+            Write-Host "Stopping test process (PID: $($process.Id)).=="
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+          }
+
+          Start-Sleep -Seconds 2
+          Take-ScreenShot ".\screenshots\03_after_close.png"
+
+      - name: Upload screenshots artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshots-${{ github.run_number }}
+          path: .\screenshots
+          if-no-files-found: warn
+          retention-days: 7
