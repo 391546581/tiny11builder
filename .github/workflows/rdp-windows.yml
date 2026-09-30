@@ -3,6 +3,14 @@ name: Windows Remote Desktop (Debug Only)
 on:
   workflow_dispatch:
     inputs:
+      tunnel_provider:
+        description: 'Tunnel provider to use'
+        required: true
+        default: 'cpolar (No Card Required)'
+        type: choice
+        options:
+          - 'cpolar (No Card Required)'
+          - 'ngrok (Requires Card Verification)'
       rdp_password:
         description: 'Temporary Windows Administrator password for RDP (leave blank to auto-generate)'
         required: false
@@ -46,7 +54,72 @@ jobs:
           Write-Host "::add-mask::$customPassword"
           "RDP_PASS=$customPassword" >> $env:GITHUB_ENV
 
+      - name: Start Cpolar TCP Tunnel (No Card Required)
+        if: ${{ startsWith(inputs.tunnel_provider, 'cpolar') }}
+        shell: powershell
+        env:
+          CPOLAR_AUTHTOKEN: ${{ secrets.CPOLAR_AUTHTOKEN }}
+        run: |
+          if (-not $env:CPOLAR_AUTHTOKEN) {
+            throw "Error: CPOLAR_AUTHTOKEN secret is not configured in Repository Settings -> Secrets and variables -> Actions. Get your free token at https://www.cpolar.com"
+          }
+
+          Write-Host "Downloading Cpolar..."
+          Invoke-WebRequest -Uri "https://static.cpolar.com/downloads/cpolar-stable-windows-amd64.zip" -OutFile "cpolar.zip"
+          Expand-Archive -Path "cpolar.zip" -DestinationPath . -Force
+
+          Write-Host "Authenticating Cpolar..."
+          .\cpolar.exe authtoken $env:CPOLAR_AUTHTOKEN
+
+          Write-Host "Starting TCP tunnel to port 3389..."
+          Start-Process -FilePath ".\cpolar.exe" -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput "cpolar.log" -RedirectStandardError "cpolar_err.log"
+
+          $endpoint = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/v2/tunnels" -ErrorAction Stop
+              if ($resp.tunnels -and $resp.tunnels[0].public_url) {
+                $rawUrl = $resp.tunnels[0].public_url
+                $endpoint = $rawUrl -replace '^tcp://', ''
+                break
+              }
+            } catch {
+              # retry
+            }
+          }
+
+          if (-not $endpoint) {
+            Write-Host "Cpolar log output:"
+            if (Test-Path cpolar.log) { Get-Content cpolar.log }
+            if (Test-Path cpolar_err.log) { Get-Content cpolar_err.log }
+            throw "Failed to start Cpolar tunnel. Verify that CPOLAR_AUTHTOKEN is valid."
+          }
+
+          Write-Host "=========================================================="
+          Write-Host " [RDP CONNECTION DETAILS READY via Cpolar] "
+          Write-Host " Computer (Host:Port) : $endpoint"
+          Write-Host " Username             : runneradmin"
+          Write-Host " Password             : $env:RDP_PASS"
+          Write-Host "=========================================================="
+
+          @"
+          ### 🖥️ Windows Remote Desktop (RDP) Ready (via Cpolar)
+
+          | Item | Value |
+          | :--- | :--- |
+          | **Host / IP:Port** | \`$endpoint\` |
+          | **Username** | \`runneradmin\` |
+          | **Password** | \`$env:RDP_PASS\` |
+
+          **How to connect:**
+          1. Press \`Win + R\` and run \`mstsc\`.
+          2. Enter \`$endpoint\` as the Computer.
+          3. Log in with user \`runneradmin\` and the password above.
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
       - name: Start Ngrok TCP Tunnel for RDP port 3389
+        if: ${{ startsWith(inputs.tunnel_provider, 'ngrok') }}
         shell: powershell
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
