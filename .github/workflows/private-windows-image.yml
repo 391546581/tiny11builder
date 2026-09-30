@@ -1,0 +1,121 @@
+name: Private Windows image build
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_drive:
+        description: Drive letter of the mounted Windows ISO on the self-hosted runner (for example E)
+        required: true
+        type: string
+      scratch_drive:
+        description: Drive letter for temporary build files (for example D)
+        required: true
+        type: string
+      image_index:
+        description: Windows image index to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: [self-hosted, windows, x64]
+    timeout-minutes: 360
+    env:
+      ISO_DRIVE: ${{ inputs.iso_drive }}
+      SCRATCH_DRIVE: ${{ inputs.scratch_drive }}
+      IMAGE_INDEX: ${{ inputs.image_index }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate runner, inputs, and build script
+        shell: powershell
+        run: |
+          if ("${{ github.event.repository.private }}" -ne "true") {
+            throw "This workflow is for private repositories only. Make the repository private before building."
+          }
+
+          $isoDrive = $env:ISO_DRIVE.Trim().TrimEnd(':').ToUpperInvariant()
+          $scratchDrive = $env:SCRATCH_DRIVE.Trim().TrimEnd(':').ToUpperInvariant()
+          if ($isoDrive -notmatch '^[D-Z]$' -or $scratchDrive -notmatch '^[D-Z]$') {
+            throw "ISO and scratch drive inputs must be drive letters from D to Z, without a colon."
+          }
+          if ($isoDrive -eq $scratchDrive) {
+            throw "The ISO drive and scratch drive must be different."
+          }
+          if ($env:IMAGE_INDEX -notmatch '^[1-9][0-9]*$') {
+            throw "Image index must be a positive integer."
+          }
+          if (-not (Test-Path "$($isoDrive):\sources\boot.wim")) {
+            throw "No mounted Windows installation media found on $($isoDrive):."
+          }
+          if (-not (Test-Path "$($isoDrive):\sources\install.wim") -and
+              -not (Test-Path "$($isoDrive):\sources\install.esd")) {
+            throw "The mounted ISO must contain sources\install.wim or sources\install.esd."
+          }
+          if (-not (Test-Path "$($scratchDrive):\")) {
+            throw "Scratch drive $($scratchDrive): is not available."
+          }
+
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "The self-hosted runner must run with Administrator privileges."
+          }
+
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE "tiny11maker.ps1"
+          if (-not (Test-Path $scriptPath -PathType Leaf)) {
+            throw "Build script not found: $scriptPath. Add your own or licensed tiny11maker.ps1 to the repository root."
+          }
+
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $scriptPath,
+            [ref]$tokens,
+            [ref]$parseErrors
+          )
+          if ($parseErrors.Count -gt 0) {
+            throw "The build script has PowerShell syntax errors: $($parseErrors[0].Message)"
+          }
+          $parameters = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+          foreach ($requiredParameter in @("ISO", "SCRATCH", "Index")) {
+            if ($parameters -notcontains $requiredParameter) {
+              throw "The build script must define -$requiredParameter so the workflow can run without interactive prompts."
+            }
+          }
+
+          $outputPath = Join-Path $env:GITHUB_WORKSPACE "tiny11.iso"
+          if (Test-Path $outputPath) {
+            throw "Output already exists at $outputPath. Move it out of the workspace before running again."
+          }
+
+      - name: Build Windows image
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $isoDrive = $env:ISO_DRIVE.Trim().TrimEnd(':').ToUpperInvariant()
+          $scratchDrive = $env:SCRATCH_DRIVE.Trim().TrimEnd(':').ToUpperInvariant()
+          $imageIndex = [int]$env:IMAGE_INDEX
+          $scriptPath = Join-Path $env:GITHUB_WORKSPACE "tiny11maker.ps1"
+          $global:LASTEXITCODE = 0
+          & $scriptPath -ISO $isoDrive -SCRATCH $scratchDrive -Index $imageIndex
+          if ($LASTEXITCODE -ne 0) {
+            throw "The image builder exited with code $LASTEXITCODE."
+          }
+
+          $outputPath = Join-Path $env:GITHUB_WORKSPACE "tiny11.iso"
+          if (-not (Test-Path $outputPath -PathType Leaf) -or (Get-Item $outputPath).Length -eq 0) {
+            throw "The build completed without producing a non-empty tiny11.iso in the repository root."
+          }
+
+      - name: Save private build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny11-${{ github.run_number }}
+          path: tiny11.iso
+          if-no-files-found: error
+          retention-days: 7
