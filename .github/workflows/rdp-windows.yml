@@ -6,10 +6,10 @@ on:
       tunnel_provider:
         description: 'Tunnel provider to use'
         required: true
-        default: 'cpolar (No Card Required)'
+        default: 'bore (100% Free & No Account Needed)'
         type: choice
         options:
-          - 'cpolar (No Card Required)'
+          - 'bore (100% Free & No Account Needed)'
           - 'ngrok (Requires Card Verification)'
       rdp_password:
         description: 'Temporary Windows Administrator password for RDP (leave blank to auto-generate)'
@@ -54,57 +54,47 @@ jobs:
           Write-Host "::add-mask::$customPassword"
           "RDP_PASS=$customPassword" >> $env:GITHUB_ENV
 
-      - name: Start Cpolar TCP Tunnel (No Card Required)
-        if: ${{ startsWith(inputs.tunnel_provider, 'cpolar') }}
+      - name: Start Bore TCP Tunnel (Zero Config & No Account)
+        if: ${{ startsWith(inputs.tunnel_provider, 'bore') }}
         shell: powershell
-        env:
-          CPOLAR_AUTHTOKEN: ${{ secrets.CPOLAR_AUTHTOKEN }}
         run: |
-          if (-not $env:CPOLAR_AUTHTOKEN) {
-            throw "Error: CPOLAR_AUTHTOKEN secret is not configured in Repository Settings -> Secrets and variables -> Actions. Get your free token at https://www.cpolar.com"
-          }
+          Write-Host "Downloading bore CLI..."
+          Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip" -OutFile "bore.zip"
+          Expand-Archive -Path "bore.zip" -DestinationPath . -Force
 
-          Write-Host "Downloading Cpolar..."
-          Invoke-WebRequest -Uri "https://static.cpolar.com/downloads/cpolar-stable-windows-amd64.zip" -OutFile "cpolar.zip"
-          Expand-Archive -Path "cpolar.zip" -DestinationPath . -Force
-
-          Write-Host "Authenticating Cpolar..."
-          .\cpolar.exe authtoken $env:CPOLAR_AUTHTOKEN
-
-          Write-Host "Starting TCP tunnel to port 3389..."
-          Start-Process -FilePath ".\cpolar.exe" -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput "cpolar.log" -RedirectStandardError "cpolar_err.log"
+          Write-Host "Starting bore TCP tunnel for 3389 to bore.pub..."
+          Start-Process -FilePath ".\bore.exe" -ArgumentList "local 3389 --to bore.pub" -RedirectStandardOutput "bore.log" -RedirectStandardError "bore_err.log"
 
           $endpoint = $null
           for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Seconds 2
-            try {
-              $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/v2/tunnels" -ErrorAction Stop
-              if ($resp.tunnels -and $resp.tunnels[0].public_url) {
-                $rawUrl = $resp.tunnels[0].public_url
-                $endpoint = $rawUrl -replace '^tcp://', ''
+            if (Test-Path bore.log) {
+              $logContent = Get-Content bore.log -Raw
+              # Look for log line: "listening at bore.pub:<port>"
+              if ($logContent -match 'listening at (bore\.pub:\d+)') {
+                $endpoint = $Matches[1]
                 break
               }
-            } catch {
-              # retry
             }
           }
 
           if (-not $endpoint) {
-            Write-Host "Cpolar log output:"
-            if (Test-Path cpolar.log) { Get-Content cpolar.log }
-            if (Test-Path cpolar_err.log) { Get-Content cpolar_err.log }
-            throw "Failed to start Cpolar tunnel. Verify that CPOLAR_AUTHTOKEN is valid."
+            Write-Host "Bore log stdout:"
+            if (Test-Path bore.log) { Get-Content bore.log }
+            Write-Host "Bore log stderr:"
+            if (Test-Path bore_err.log) { Get-Content bore_err.log }
+            throw "Failed to start Bore tunnel. Check logs above."
           }
 
           Write-Host "=========================================================="
-          Write-Host " [RDP CONNECTION DETAILS READY via Cpolar] "
+          Write-Host " [RDP CONNECTION DETAILS READY via Bore] "
           Write-Host " Computer (Host:Port) : $endpoint"
           Write-Host " Username             : runneradmin"
           Write-Host " Password             : $env:RDP_PASS"
           Write-Host "=========================================================="
 
           @"
-          ### 🖥️ Windows Remote Desktop (RDP) Ready (via Cpolar)
+          ### 🖥️ Windows Remote Desktop (RDP) Ready (via Bore)
 
           | Item | Value |
           | :--- | :--- |
