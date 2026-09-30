@@ -1,0 +1,132 @@
+name: Windows Remote Desktop (Debug Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_password:
+        description: 'Temporary Windows Administrator password for RDP (leave blank to auto-generate)'
+        required: false
+        default: ''
+        type: string
+      keep_alive_minutes:
+        description: 'How long to keep the RDP session alive (in minutes, max 360)'
+        required: false
+        default: '60'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rdp-session:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure Windows user and enable RDP
+        shell: powershell
+        id: setup_user
+        run: |
+          $customPassword = "${{ inputs.rdp_password }}".Trim()
+          if (-not $customPassword) {
+            # Auto-generate a strong password: 16 chars with letters, numbers, and symbols
+            $bytes = New-Object byte[] 12
+            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+            $customPassword = [System.Convert]::ToBase64String($bytes) + "!Aa1"
+          }
+
+          Write-Host "Configuring runneradmin user password..."
+          net user runneradmin $customPassword | Out-Null
+
+          Write-Host "Enabling Remote Desktop Service and Firewall..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+
+          Write-Host "::add-mask::$customPassword"
+          "RDP_PASS=$customPassword" >> $env:GITHUB_ENV
+
+      - name: Start Ngrok TCP Tunnel for RDP port 3389
+        shell: powershell
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          if (-not $env:NGROK_AUTHTOKEN) {
+            throw "Error: NGROK_AUTHTOKEN secret is not configured in Repository Settings -> Secrets and variables -> Actions."
+          }
+
+          Write-Host "Downloading Ngrok..."
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "ngrok.zip"
+          Expand-Archive -Path "ngrok.zip" -DestinationPath . -Force
+
+          Write-Host "Authenticating Ngrok..."
+          .\ngrok.exe config add-authtoken $env:NGROK_AUTHTOKEN
+
+          Write-Host "Starting TCP tunnel to port 3389..."
+          Start-Process -FilePath ".\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput "ngrok.log" -RedirectStandardError "ngrok_err.log"
+
+          # Wait for tunnel initialization and retrieve public endpoint
+          $endpoint = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop
+              if ($resp.tunnels -and $resp.tunnels[0].public_url) {
+                $rawUrl = $resp.tunnels[0].public_url
+                # rawUrl is like: tcp://0.tcp.ngrok.io:12345 -> extract 0.tcp.ngrok.io:12345
+                $endpoint = $rawUrl -replace '^tcp://', ''
+                break
+              }
+            } catch {
+              # wait and retry
+            }
+          }
+
+          if (-not $endpoint) {
+            Write-Host "Ngrok log output:"
+            if (Test-Path ngrok.log) { Get-Content ngrok.log }
+            if (Test-Path ngrok_err.log) { Get-Content ngrok_err.log }
+            throw "Failed to start Ngrok tunnel. Verify that NGROK_AUTHTOKEN is valid."
+          }
+
+          Write-Host "=========================================================="
+          Write-Host " [RDP CONNECTION DETAILS READY] "
+          Write-Host " Computer (Host:Port) : $endpoint"
+          Write-Host " Username             : runneradmin"
+          Write-Host " Password             : $env:RDP_PASS"
+          Write-Host "=========================================================="
+
+          # Output connection details to GitHub Step Summary
+          @"
+          ### 🖥️ Windows Remote Desktop (RDP) Ready
+
+          | Item | Value |
+          | :--- | :--- |
+          | **Host / IP:Port** | \`$endpoint\` |
+          | **Username** | \`runneradmin\` |
+          | **Password** | \`$env:RDP_PASS\` |
+
+          **How to connect:**
+          1. Press \`Win + R\` and run \`mstsc\`.
+          2. Enter \`$endpoint\` as the Computer.
+          3. Log in with user \`runneradmin\` and the password above.
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Keep session alive
+        shell: powershell
+        run: |
+          $minutes = [int]"${{ inputs.keep_alive_minutes }}"
+          if ($minutes -le 0 -or $minutes -gt 360) {
+            $minutes = 60
+          }
+          Write-Host "Session is running. You can connect now."
+          Write-Host "The session will remain active for $minutes minute(s)."
+          Write-Host "To finish early, cancel the workflow run in GitHub Actions."
+
+          $seconds = $minutes * 60
+          for ($i = 0; $i -lt $seconds; $i += 30) {
+            Start-Sleep -Seconds 30
+            $remaining = [math]::Round(($seconds - $i) / 60, 1)
+            Write-Host "RDP session active... approximately $remaining minutes remaining."
+          }
+          Write-Host "Session duration completed. Cleaning up..."
